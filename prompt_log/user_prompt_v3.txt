@@ -1,0 +1,14 @@
+
+Decision format (only):
+Decision: INCLUDE / EXCLUDE
+Reasoning: 1‑2 concise bullet points explaining which rule(s) led to your decision.
+
+Be strict, but remember that **conceptual, theoretical, or critical EJ analyses count as meaningful engagement**. If the abstract is very short or ambiguous, default to **INCLUDE** rather than EXCLUDE.
+
+---
+ABSTRACT:
+{ABSTRACT}
+
+---
+TITLE:
+{TITLE}

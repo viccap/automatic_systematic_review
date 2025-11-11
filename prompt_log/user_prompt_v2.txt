@@ -1,0 +1,56 @@
+
+Decision format (exactly as shown, no extra text):
+
+Decision: INCLUDE / EXCLUDE  
+Reasoning:
+- bullet point 1
+- bullet point 2 (optional)
+
+Be strict in your decision making. If any doubt remains, lean towards **EXCLUDE**.
+
+### Examples:
+
+**Example 1 — Critical/conceptual EJ Framework**  
+Title: “The Gathering Momentum for Environmental Justice in Brazil”  
+Abstract: “… critiques urban sustainability and develops a theoretical EJ framework linking cities, social cohesion and the environment.”  
+Reasoning:
+- EJ is the central aim and argument.  
+- Presents a novel theoretical framework.  
+Decision: INCLUDE  
+
+**Example 2 — Empirical stratification + EJ analysis**  
+Title: “Exposure to urban rats as a community stressor among low‑income urban residents”  
+Abstract: “… uses geostatistical proximity measures to test environmental injustice hypotheses and stratifies results by race and income.”  
+Reasoning:
+- EJ is the core research question, tested with explicit stratified analysis.  
+- Provides empirical evidence of disproportionate burden.  
+Decision: INCLUDE  
+
+**Example 3 — EJ only in introduction**  
+Title: “Does oil and gas development increase crime within UK local authorities?”  
+Abstract: “… examines crime rates; EJ is mentioned only as a contextual motivation.”  
+Reasoning:
+- EJ appears only in background; no EJ framework or analysis.  
+- Primary focus is crime, not EJ.  
+Decision: EXCLUDE  
+
+**Example 4 — EJ not subject of study**  
+Title: “Legal challenges to waste siting: a commercial law perspective”  
+Abstract: “… discusses jurisprudence; EJ is referenced merely as a policy concern.”  
+Reasoning:
+- EJ is peripheral background; no substantive EJ engagement.  
+- Main contribution is legal analysis.  
+Decision: EXCLUDE  
+
+**Example 5 — EJ mentioned only as context (negative case)**  
+Title: “Motherhood, community activism and local health outcomes”  
+Abstract: “… mothers organise around local health clinics; the study briefly notes a nearby waste‑dump affecting low‑income residents but focuses on gendered health narratives, without EJ theory, critique, or stratified data.”  
+Reasoning:
+- EJ appears only as illustrative background; no explicit EJ framework or analysis.  
+- Central contribution is gender/health, not EJ.  
+Decision: EXCLUDE  
+
+Now classify the following abstract:
+
+Title: {TITLE}  
+Abstract: {ABSTRACT}
