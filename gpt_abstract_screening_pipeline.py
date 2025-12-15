@@ -1,74 +1,89 @@
-import pandas as pd
-import numpy as np
-from openpyxl import load_workbook
-import sklearn
-from openai import OpenAI
-from IPython.display import display, HTML
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-import time
-import main_prompt
+"""
+LLM-assisted abstract screening pipeline with prompt revision support.
+
+Key improvements over the prior script:
+- No side effects on import (execution is gated by __main__).
+- Model selection is respected; no hard-coded model overrides.
+- Robust prompt path/version handling and placeholder safety.
+- Clean train/val/test split to reduce overfitting risk.
+- Per-iteration prediction buffers (no global, cumulative state leakage).
+- Safer output parsing with JSON-first fallback to regex.
+- Graceful metric handling for degenerate class distributions.
+"""
+
+from __future__ import annotations
+
+import json
 import os
 import re
-from sklearn.metrics import confusion_matrix, precision_score, recall_score, accuracy_score, ConfusionMatrixDisplay
-import matplotlib.pyplot as plt
-from dotenv import load_dotenv  
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import pandas as pd
+import sklearn.model_selection
+from dotenv import load_dotenv
+from openai import OpenAI
+from sklearn.metrics import (
+    ConfusionMatrixDisplay,
+    accuracy_score,
+    confusion_matrix,
+    precision_score,
+    recall_score,
+)
+
+import critic_prompt
+import revision_prompt
+
+MAIN_MODEL = "deepseek-r1"#"qwen3-235b-a22b"
+CRITIC_MODEL = "deepseek-r1"
+REVISION_MODEL = "deepseek-r1"#"mistral-large-instruct"
+
+PROMPT_VERSION_PATTERN = re.compile(r"(system|user)_prompt_v(?P<version>\d+)\.txt$")
+DEFAULT_SYSTEM_PROMPT = Path("prompt_log/system_prompt_v1.txt")
+DEFAULT_USER_PROMPT = Path("prompt_log/user_prompt_v1.txt")
+DEFAULT_DATASET = Path("V1_abstract_screening.xlsx")
+
+# Keep the model output tightly structured so parsing is reliable.
+OUTPUT_FORMAT_HINT = """
+---
+Output format (required):
+Return JSON only, no prose, no markdown fences. Example:
+{"decision": "INCLUDE", "rationale": "<one-sentence justification>"}
+Allowed decision values: INCLUDE or EXCLUDE.
+"""
+
 load_dotenv()
 
-MAIN_MODEL = "qwen3-235b-a22b"       
-CRITIC_MODEL = "deepseek-r1"        
-REVISION_MODEL = "mistral-large-instruct"
 
-RELEVANCE_DATASET_COLUMNS = ["short_id", "output"]
-relevance_dataset_lock = Lock()
-relevance_dataset = pd.DataFrame(columns=RELEVANCE_DATASET_COLUMNS)
+@dataclass
+class PromptPaths:
+    system_path: Path
+    user_path: Path
 
-
-def _append_to_relevance_dataset(short_id, output):
-    """Store the model's output alongside the article identifier."""
-    global relevance_dataset
-    new_entry = pd.DataFrame({"short_id": [short_id], "output": [output]})
-    with relevance_dataset_lock:
-        relevance_dataset = pd.concat([relevance_dataset, new_entry], ignore_index=True)
-    return relevance_dataset
-
-
-def _extract_vote_from_output(output_text):
-    if not isinstance(output_text, str):
-        return None
-    decision_match = re.search(r"Decision:\s*(INCLUDE|EXCLUDE)", output_text, re.IGNORECASE)
-    if decision_match:
-        return decision_match.group(1).upper()
-    return None
+    def next_version(self, system_text: str, user_text: str) -> "PromptPaths":
+        """
+        Save the next version of the prompts and return updated paths.
+        """
+        next_sys = _bump_prompt_path(self.system_path)
+        next_user = _bump_prompt_path(self.user_path)
+        next_sys.write_text(system_text)
+        next_user.write_text(_ensure_placeholders(user_text))
+        return PromptPaths(system_path=next_sys, user_path=next_user)
 
 
-def _build_comparison_df(prediction_df, ground_truth_df):
-    required_prediction_cols = {"short_id", "output"}
-    required_ground_truth_cols = {"short_id", "included"}
 
-    if not required_prediction_cols.issubset(prediction_df.columns):
-        missing = required_prediction_cols.difference(prediction_df.columns)
-        raise ValueError(f"prediction_df is missing required columns: {missing}")
-    if not required_ground_truth_cols.issubset(ground_truth_df.columns):
-        missing = required_ground_truth_cols.difference(ground_truth_df.columns)
-        raise ValueError(f"ground_truth_df is missing required columns: {missing}")
+def init_client() -> OpenAI:
+    api_key = os.getenv("API_KEY")
+    base_url = os.getenv("BASE_URL", "https://chat-ai.academiccloud.de/v1")
+    if not api_key:
+        raise RuntimeError("API_KEY missing from environment. Set it before running.")
+    return OpenAI(api_key=api_key, base_url=base_url)
 
-    merged = pd.merge(
-        ground_truth_df[["short_id", "included"]].copy(),
-        prediction_df[["short_id", "output"]].copy(),
-        on="short_id",
-        how="inner",
-    )
-
-    merged["vote"] = merged["output"].apply(_extract_vote_from_output)
-    if merged["vote"].isnull().any():
-        raise ValueError("Could not extract INCLUDE/EXCLUDE decision from one or more model outputs.")
-
-    return merged
 
 def _ensure_placeholders(prompt_text: str) -> str:
-    # minimal safety net: append a tiny section for any missing key
-    parts = []
+    parts: List[str] = []
     if "{ABSTRACT}" not in prompt_text:
         parts.append("\n\n---\nABSTRACT:\n{ABSTRACT}")
     if "{TITLE}" not in prompt_text:
@@ -76,286 +91,306 @@ def _ensure_placeholders(prompt_text: str) -> str:
     return prompt_text + "".join(parts)
 
 
-def preprocess_ground_truth_df(file_path): #sheet_name='HVW'sheet_name='HVW'
-    df = pd.read_excel(file_path)
+def _read_prompt(path: Path) -> str:
+    return path.read_text()
 
-    df_train = df.drop(columns=['included', 'article_type'])
-    df_test = df[['short_id', 'included']]
 
-    X_train, X_test, y_train, y_test = sklearn.model_selection.train_test_split(df_train, df_test, test_size=0.2, random_state=42)
-    return X_train, X_test, y_train, y_test
+def _format_user_prompt(template_path: Path, abstract: str, title: str) -> str:
+    base = _read_prompt(template_path).format(ABSTRACT=abstract, TITLE=title)
+    return base + OUTPUT_FORMAT_HINT
 
-#X_train, X_test, y_train, y_test = preprocess_ground_truth_df('abstract_screening.xlsx', sheet_name='HVW')
 
-def initilize_agent():
-    load_dotenv()
-    api_key = os.getenv("API_KEY")
-    base_url = "https://chat-ai.academiccloud.de/v1"
-    client = OpenAI(api_key = api_key, base_url = base_url)
-    return client
+def _bump_prompt_path(path: Path) -> Path:
+    """
+    Increment a prompt filename version (e.g., system_prompt_v1.txt -> system_prompt_v2.txt).
+    """
+    match = PROMPT_VERSION_PATTERN.search(path.name)
+    if not match:
+        raise ValueError(f"Prompt filename does not match expected pattern: {path}")
+    version = int(match.group("version"))
+    next_version = version + 1
+    return path.with_name(f"{match.group(1)}_prompt_v{next_version}.txt")
 
-def format_prompt(abstract, title, short_id, system_prompt_file_path, user_prompt_file_path):
-    file1 = open(system_prompt_file_path, 'r')
-    formatted_system_prompt = file1.read()
-    file1.close()
 
-    file2 = open(user_prompt_file_path, 'r')
-    user_prompt = file2.read()
-    file2.close()
+def _extract_vote(output_text: str) -> Optional[str]:
+    """
+    Extract INCLUDE/EXCLUDE from model output.
+    Prefers JSON payloads like {"decision": "INCLUDE"}; falls back to regex.
+    """
+    if not isinstance(output_text, str):
+        return None
+    cleaned = output_text.strip()
+    # Remove code fences if present.
+    fenced_match = re.search(r"```(?:json)?\s*(.*?)```", cleaned, re.DOTALL | re.IGNORECASE)
+    if fenced_match:
+        cleaned = fenced_match.group(1).strip()
 
-    formatted_user_prompt = user_prompt.format(ABSTRACT=abstract, TITLE=title)
-    return formatted_system_prompt, formatted_user_prompt, short_id
+    # Try JSON first.
+    try:
+        parsed = json.loads(cleaned)
+        decision = parsed.get("decision") or parsed.get("Decision")
+        if isinstance(decision, str):
+            decision_upper = decision.strip().upper()
+            if decision_upper in {"INCLUDE", "EXCLUDE"}:
+                return decision_upper
+    except (json.JSONDecodeError, TypeError):
+        pass
 
-def critic_format_prompt(title, abstract, chain_of_thought, prediction, ground_truth, previous_system_prompt_file_path, previous_user_prompt_file_path):
-    file1 = open(previous_system_prompt_file_path, 'r')
-    prev_system_prompt = file1.read()
-    file1.close()
+    # Fallback regex.
+    match = re.search(r"Decision:\s*(INCLUDE|EXCLUDE)", cleaned, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    # Generic containment fallback.
+    generic_match = re.search(r"\b(INCLUDE|EXCLUDE)\b", cleaned, re.IGNORECASE)
+    if generic_match:
+        return generic_match.group(1).upper()
+    return None
 
-    file2 = open(previous_user_prompt_file_path, 'r')
-    prev_user_prompt = file2.read()
-    file2.close()
 
-    formatted_user_prompt = critic_prompt.CRITIC_USER.format(
-        TITLE=title, ABSTRACT=abstract, CHAIN_OF_THOUGHT=chain_of_thought, 
-        VOTE=prediction, DECISION=ground_truth, SYSTEM_PROMPT=prev_system_prompt, USER_PROMPT = prev_user_prompt)
-    
-    return formatted_user_prompt
+def _build_comparison_df(predictions: pd.DataFrame, truth: pd.DataFrame) -> pd.DataFrame:
+    merged = pd.merge(
+        truth[["short_id", "included"]], predictions[["short_id", "output"]], on="short_id", how="inner"
+    ).copy()
+    merged["vote"] = merged["output"].apply(_extract_vote)
+    if merged["vote"].isnull().any():
+        raise ValueError("One or more model outputs lacked a valid INCLUDE/EXCLUDE decision.")
+    merged["y_true"] = merged["included"].str.lower().map({"yes": 1, "no": 0})
+    merged["y_pred"] = merged["vote"].map({"INCLUDE": 1, "EXCLUDE": 0})
+    return merged
 
-def revision_format_prompt(title, abstract, agent_reasoning, wrong_decision, correct_label, critic_feedback, previous_system_prompt_file_path, previous_user_prompt_file_path):
-    file1 = open(previous_system_prompt_file_path, 'r')
-    prev_system_prompt = file1.read()
-    file1.close()
 
-    file2 = open(previous_user_prompt_file_path, 'r')
-    prev_user_prompt = file2.read()
-    file2.close()
+def evaluate_predictions(predictions: pd.DataFrame, truth: pd.DataFrame, show_plot: bool = False) -> Tuple[Dict, pd.DataFrame]:
+    """
+    Compute metrics and return (metrics_dict, false_classifications_df).
+    """
+    df = _build_comparison_df(predictions, truth)
+    cm = confusion_matrix(df["y_true"], df["y_pred"], labels=[0, 1])
+    metrics = {
+        "accuracy": accuracy_score(df["y_true"], df["y_pred"]),
+        "precision": precision_score(df["y_true"], df["y_pred"], zero_division=0),
+        "recall": recall_score(df["y_true"], df["y_pred"], zero_division=0),
+        "confusion_matrix": cm,
+    }
+    # Warn if we only saw one class; metrics will be unstable.
+    if df["y_true"].nunique() < 2 or df["y_pred"].nunique() < 2:
+        print("Warning: only one class present in y_true or y_pred; metrics may be uninformative.")
+    if show_plot:
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["EXCLUDE", "INCLUDE"])
+        disp.plot()
+    false_clf = df[df["y_true"] != df["y_pred"]]
+    return metrics, false_clf
 
-    formatted_user_prompt = revision_prompt.REVISION_USER_PROMPT.format(
-        title=title, abstract=abstract, agent_reasoning=agent_reasoning,
-        wrong_decision=wrong_decision, correct_label=correct_label,
-        critic_feedback=critic_feedback, original_system_prompt=prev_system_prompt,
-        original_user_prompt=prev_user_prompt)
-    
-    return formatted_user_prompt
 
-def get_relevance_score(MODEL, formatted_system_prompt, formatted_user_prompt, short_id):
-    client = initilize_agent()
-    chat_completion = client.chat.completions.create(messages=[{"role":"system","content": formatted_system_prompt},
-                                                            {"role":"user","content": formatted_user_prompt}], model='openai-gpt-oss-120b')#'qwen3-235b-a22b')
+def split_dataset(df: pd.DataFrame, train_size: float = 0.6, val_size: float = 0.2, seed: int = 42):
+    """
+    Returns X_train, X_val, X_test, y_train, y_val, y_test.
+    """
+    X = df.drop(columns=["included", "article_type"])
+    y = df[["short_id", "included"]]
+    X_train, X_tmp, y_train, y_tmp = sklearn.model_selection.train_test_split(X, y, test_size=1 - train_size, random_state=seed)
+    relative_val = val_size / (1 - train_size)
+    X_val, X_test, y_val, y_test = sklearn.model_selection.train_test_split(
+        X_tmp, y_tmp, test_size=1 - relative_val, random_state=seed
+    )
+    return X_train, X_val, X_test, y_train, y_val, y_test
 
+
+def get_relevance_score(
+    client: OpenAI,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    short_id: str,
+    sleep_seconds: float = 2.0,
+) -> Dict:
+    """
+    Call the screening agent and return a record dict.
+    """
+    chat_completion = client.chat.completions.create(
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+        model=model,
+    )
     output = chat_completion.choices[0].message.content.strip()
-    # so that the API rate limit is not exceeded
-    time.sleep(8)
-    print(f"Processed {short_id} with output: {output}")
-    updated_dataset = _append_to_relevance_dataset(short_id, output)
-    get_relevance_score.dataset = updated_dataset
-    return updated_dataset
-
-def evaluation(prediction_df, ground_truth_df):
-    comparison_df = None
-    comparison_df = _build_comparison_df(prediction_df, ground_truth_df)
-    print("Comparison DataFrame:")
-    print(comparison_df)
-    comparison_df['y_true'] = comparison_df['included'].map({'yes': 1, 'no': 0})
-    comparison_df['y_pred'] = comparison_df['vote'].map({'INCLUDE': 1, 'EXCLUDE': 0})
-
-    cm = confusion_matrix(comparison_df['y_true'], comparison_df['y_pred'])
-    TN, FP, FN, TP = cm.ravel()
-
-    accuracy = accuracy_score(comparison_df['y_true'], comparison_df['y_pred'])
-    precision = precision_score(comparison_df['y_true'], comparison_df['y_pred'])
-    recall = recall_score(comparison_df['y_true'], comparison_df['y_pred'])
-
-    print("Confusion Matrix:")
-    print(pd.DataFrame(cm, index=['Actual no','Actual yes'], columns=['Pred EXCLUDE','Pred INCLUDE']))
-    print()
-    print(f"True Positive (TP): {TP}")
-    print(f"True Negative (TN): {TN}")
-    print(f"False Positive (FP): {FP}")
-    print(f"False Negative (FN): {FN}")
-    print()
-    print(f"Accuracy: {accuracy:.2f}")
-    print(f"Precision: {precision:.2f}")
-    print(f"Recall: {recall:.2f}")
-
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['EXCLUDE', 'INCLUDE'])
-    disp.plot(cmap=plt.cm.Blues)
-    plt.title('Confusion Matrix — INCLUDE vs EXCLUDE')
-    plt.xlabel('Predicted label')
-    plt.ylabel('True label')
-    plt.show()
-
-    false_clf_df = comparison_df[comparison_df['y_true'] != comparison_df['y_pred']]
-    return false_clf_df
+    time.sleep(sleep_seconds)  # basic rate limiting
+    print(f"Screening output for {short_id}:\n{output}\n")
+    return {"short_id": short_id, "output": output}
 
 
-import critic_prompt
+def critic_agent(
+    client: OpenAI,
+    row: pd.Series,
+    prompt_paths: PromptPaths,
+    model: str = CRITIC_MODEL,
+) -> str:
+    ground_truth_df = pd.read_excel(DEFAULT_DATASET)
+    short_id = row["short_id"]
+    paper = ground_truth_df.loc[ground_truth_df.short_id == short_id].iloc[0]
+    critic_user_prompt = critic_prompt.CRITIC_USER.format(
+        TITLE=paper.title,
+        ABSTRACT=paper.abstract,
+        CHAIN_OF_THOUGHT=row["output"],
+        VOTE=row["vote"],
+        DECISION=row["included"],
+        SYSTEM_PROMPT=_read_prompt(prompt_paths.system_path),
+        USER_PROMPT=_read_prompt(prompt_paths.user_path),
+    )
+    chat_completion = client.chat.completions.create(
+        messages=[{"role": "system", "content": critic_prompt.CRITIC_SYSTEM}, {"role": "user", "content": critic_user_prompt}],
+        model=model,
+    )
+    print(f"Critic output:\n{chat_completion.choices[0].message.content.strip()}\n")
+    return chat_completion.choices[0].message.content.strip()
 
-def critic_agent(false_clf_df, previous_system_prompt_file_path, previous_user_prompt_file_path):
-    client = initilize_agent()
-    print("______________________________")
-    print(false_clf_df)
-    print("______________________________")
-    short_id = false_clf_df['short_id']
-    ground_truth_df = pd.read_excel("V1_abstract_screening.xlsx") ## include this as a general argument to the function
-    paper_title = ground_truth_df.loc[ground_truth_df.short_id == short_id].title
-    paper_abstract = ground_truth_df.loc[ground_truth_df.short_id == short_id].abstract
 
-    formatted_critic_user_prompt = critic_format_prompt(
-        title=paper_title, #false_clf_df['title'],
-        abstract=paper_abstract, #false_clf_df['abstract'],
-        chain_of_thought=false_clf_df["output"],
-        prediction=false_clf_df["vote"],
-        ground_truth=false_clf_df["included"],
-        previous_system_prompt_file_path=previous_system_prompt_file_path,
-        previous_user_prompt_file_path=previous_user_prompt_file_path)
-    
-    chat_completion = client.chat.completions.create(messages=[{"role":"system","content": critic_prompt.CRITIC_SYSTEM},
-                                                           {"role":"user","content": formatted_critic_user_prompt}],
-                                                           model='openai-gpt-oss-120b')#'deepseek-r1')
-
-    critic_output = chat_completion.choices[0].message.content.strip()
-    time.sleep(1)
-    return critic_output
-
-import revision_prompt
-
-def revision_agent(false_clf_df, feedback, previous_system_prompt_file_path, previous_user_prompt_file_path):
-    client = initilize_agent()
-
-    short_id = false_clf_df['short_id']
-    ground_truth_df = pd.read_excel("V1_abstract_screening.xlsx") ## include this as a general argument to the function
-    paper_title = ground_truth_df.loc[ground_truth_df.short_id == short_id].title
-    paper_abstract = ground_truth_df.loc[ground_truth_df.short_id == short_id].abstract
-
-    formatted_user_prompt = revision_format_prompt(
-        title=paper_title, #false_clf_df['title'],
-        abstract=paper_abstract, #false_clf_df['abstract'],
-        agent_reasoning=false_clf_df["output"],
-        wrong_decision=false_clf_df["vote"],
-        correct_label=false_clf_df["included"],
+def revision_agent(
+    client: OpenAI,
+    row: pd.Series,
+    feedback: str,
+    prompt_paths: PromptPaths,
+    model: str = REVISION_MODEL,
+) -> str:
+    ground_truth_df = pd.read_excel(DEFAULT_DATASET)
+    short_id = row["short_id"]
+    paper = ground_truth_df.loc[ground_truth_df.short_id == short_id].iloc[0]
+    user_prompt = revision_prompt.REVISION_USER_PROMPT.format(
+        title=paper.title,
+        abstract=paper.abstract,
+        agent_reasoning=row["output"],
+        wrong_decision=row["vote"],
+        correct_label=row["included"],
         critic_feedback=feedback,
-        previous_system_prompt_file_path=previous_system_prompt_file_path,
-        previous_user_prompt_file_path=previous_user_prompt_file_path)
-    
-    system_prompt = revision_prompt.REVISION_SYSTEM_PROMPT
+        original_system_prompt=_read_prompt(prompt_paths.system_path),
+        original_user_prompt=_read_prompt(prompt_paths.user_path),
+    )
+    chat_completion = client.chat.completions.create(
+        messages=[{"role": "system", "content": revision_prompt.REVISION_SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}],
+        model=model,
+    )
+    return chat_completion.choices[0].message.content.strip()
 
-    chat_completion = client.chat.completions.create(messages=[{"role":"system","content": system_prompt},
-                                                           {"role":"user","content": formatted_user_prompt}],
-                                                           model='openai-gpt-oss-120b')#'mistral-large-instruct')
+def parse_revised_prompts(revised_prompts_text: str, current_prompts: PromptPaths) -> Tuple[str, str]:
+    """
+    Split revision output into system/user prompts and ensure they differ from the originals.
+    """
+    if "---REVISED USER PROMPT---" not in revised_prompts_text:
+        raise ValueError("Revision output missing delimiter '---REVISED USER PROMPT---'.")
+    system_text, user_text = revised_prompts_text.split("---REVISED USER PROMPT---", maxsplit=1)
+    system_text = system_text.replace("---REVISED SYSTEM PROMPT---", "", 1).strip()
+    user_text = user_text.strip()
 
-    revised_prompt = chat_completion.choices[0].message.content.strip()
-    print("Revised Prompt Generated.")
-    print(revised_prompt)
-    time.sleep(1)
+    # Strip any inadvertent <think>...</think> reasoning blocks.
+    system_text = re.sub(r"<think>.*?</think>", "", system_text, flags=re.DOTALL | re.IGNORECASE).strip()
+    user_text = re.sub(r"<think>.*?</think>", "", user_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
-    return revised_prompt
+    original_system = _read_prompt(current_prompts.system_path).strip()
+    original_user = _read_prompt(current_prompts.user_path).strip()
 
-def save_prompt(revised_prompt, old_file_path):
-    name = old_file_path.split('.')[1]
-    prompt_version = int(name[-1])
-    prompt_version += 1
-    if "system" in old_file_path:
-        filename = "system_prompt_v" + str(prompt_version) + ".txt"
-        with open("./prompt_log/system_prompt_v" + str(prompt_version) + '.txt', 'w') as file:
-            file.write(revised_prompt)
+    if system_text == original_system and user_text == original_user:
+        raise ValueError("Revision agent returned prompts identical to the originals; refusing to save.")
+
+    return system_text, user_text
+
+
+def run_screening_batch(
+    client: OpenAI,
+    model: str,
+    data: pd.DataFrame,
+    prompt_paths: PromptPaths,
+    limit: Optional[int] = None,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """
+    Screen a batch of abstracts and return predictions DataFrame.
+    Rows are randomly sampled (deterministically via random_state) to avoid class skew from ordering.
+    """
+    records: List[Dict] = []
+    system_prompt = _read_prompt(prompt_paths.system_path)
+
+    if limit is None:
+        batch = data
     else:
-        formatted_revised_prompt = _ensure_placeholders(revised_prompt)
-        filename = "user_prompt_v" + str(prompt_version) + ".txt"
-        with open("./prompt_log/user_prompt_v" + str(prompt_version) + '.txt', 'w') as file:
-            file.write(formatted_revised_prompt)
-    return filename, prompt_version
+        batch = data.sample(n=min(limit, len(data)), random_state=random_state)
 
-    # Example usage:
-    # df['Relevance Score'] = df['Abstract'].apply(get_relevance_score)
-
-
-    #get_relevance_score.dataset = relevance_dataset
-# fix the issue that in the next iteration the false clf is already created
-VIEWED_SHORT_IDS = set()
-def full_iteration(ground_truth_df, file_path_sys_prompt, file_path_user_prompt, false_clf_df=None):
-    X_train, X_test, y_train, y_test = preprocess_ground_truth_df(file_path=ground_truth_df) #  sheet_name='HVW' (file_path='abstract_screening.xlsx', sheet_name='HVW')
-    # For demonstration, we will use only the first 200 entries from the training set
-    X_train_llm = X_train[:50] #200
-    y_train_llm = y_train[:50] #200
-
-    abstracts = X_train_llm['abstract'].tolist()
-    titles = X_train_llm['title'].tolist()
-    short_ids = X_train_llm['short_id'].tolist()
-
-    for i in range(0, 3): #range(len(short_ids)) # for testing purpose, we will use only the first 3 entries
-        print(f"Entry {i}: short_id {short_ids[i]}")
-        formatted_system_prompt, formatted_user_prompt, short_id = format_prompt(abstracts[i], titles[i], short_ids[i], file_path_sys_prompt, file_path_user_prompt) # "./prompt_log/system_prompt_v1.txt", "./prompt_log/user_prompt_v1.txt"
-        model = 'openai-gpt-oss-120b'
-        updated_dataset = None
-        updated_dataset = get_relevance_score(MODEL=model, formatted_system_prompt=formatted_system_prompt, formatted_user_prompt=formatted_user_prompt, short_id=short_id)
-    print(updated_dataset)
-
-    #incase you want to save the dataset
-    #updated_dataset.to_csv("relevance_dataset_examples.csv", index=False)
-    #updated_dataset = pd.read_csv("relevance_dataset_examples.csv")
-
-    print("Evaluation on training set:")
-    false_clf_df = None
-    false_clf_df = evaluation(updated_dataset, y_train_llm)
-    print("Critic agent analysis on false classifications:")
-
-    filtered_false_clf_df = false_clf_df[~false_clf_df['short_id'].isin(VIEWED_SHORT_IDS)]
-    if len(filtered_false_clf_df) == 0:
-        print("No new false classifications to analyze.")
-        return false_clf_df, file_path_sys_prompt, file_path_user_prompt
-    else:
-        row = filtered_false_clf_df.iloc[0]
-        # ----- FIX THIS -----
-        print(f"Analyzing false classification for short_id: {row['short_id']}")
-        critic_output = critic_agent(row, previous_system_prompt_file_path="./prompt_log/system_prompt_v1.txt", previous_user_prompt_file_path="./prompt_log/user_prompt_v1.txt")
-        print(f"Critic Output:\n{critic_output}\n")
-        print("revising the prompt...")
-        revised_output = revision_agent(row, feedback=critic_output, previous_system_prompt_file_path="./prompt_log/system_prompt_v1.txt", previous_user_prompt_file_path="./prompt_log/user_prompt_v1.txt")
-        print(f"Revised Output:\n{revised_output}\n")
-
-        VIEWED_SHORT_IDS.add(row['short_id'])
-
-        revised_prompts = revised_output.split("---REVISED USER PROMPT---")
-        #prompts = revised_output.split("PROMPT---")
-        revised_user_prompt = revised_prompts[1]
-        #revised_system_prompt = prompts[0].split("---REVISED SYSTEM PROMPT---")[1]
-        revised_system_prompt = revised_prompts[0]#.split("---REVISED SYSTEM PROMPT---")[1]
-
-        user_prompt_filename, prompt_version = save_prompt(revised_user_prompt, file_path_user_prompt)
-        system_prompt_filename, prompt_version = save_prompt(revised_system_prompt, file_path_sys_prompt)
-        print("revised user prompt: " + revised_user_prompt)
-        print("revised system prompt: " + revised_system_prompt)
-        print("saved under: " + user_prompt_filename + " and " + system_prompt_filename + " version: " + str(prompt_version))
-        time.sleep(1)
-
-        print("Process completed. Horray! ")
-    return false_clf_df, system_prompt_filename, user_prompt_filename
+    for _, row in batch.iterrows():
+        user_prompt = _format_user_prompt(prompt_paths.user_path, abstract=row["abstract"], title=row["title"])
+        record = get_relevance_score(
+            client=client,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            short_id=row["short_id"],
+        )
+        records.append(record)
+    return pd.DataFrame(records)
 
 
-def main():
-    # denk nochmal über die logik von dieser funktion nach -> wie kann man garantieren, dass die iteration die korrekten agrumente bekommt
-    ground_truth_df = "V1_abstract_screening.xlsx"
-    system_prompt_filename = "./prompt_log/system_prompt_v1.txt"
-    user_prompt_filename = "./prompt_log/user_prompt_v1.txt"
-    false_clf_df = None
-    for i in range(3):
-        false_clf_df = None
-        false_clf_df, system_prompt_filename, user_prompt_filename = full_iteration(ground_truth_df, system_prompt_filename, user_prompt_filename, false_clf_df)
-        print("file saved as: " + system_prompt_filename + " and " + user_prompt_filename)
+def iterative_prompt_optimization(
+    ground_truth_path: Path = DEFAULT_DATASET,
+    prompt_paths: PromptPaths = PromptPaths(DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT),
+    main_model: str = MAIN_MODEL,
+    critic_model: str = CRITIC_MODEL,
+    revision_model: str = REVISION_MODEL,
+    max_iterations: int = 3,
+    train_limit: int = 50,
+    calls_per_iter: int = 6, # this is fairly large; adjust based on budget
+) -> None:
+    """
+    Run iterative prompt refinement using train for tuning and val for selection.
+    """
+    df = pd.read_excel(ground_truth_path)
+    X_train, X_val, X_test, y_train, y_val, y_test = split_dataset(df)
+    client = init_client()
 
-        print(f"Completed iteration {i+1}\n\n")
-        system_prompt_filename = "./prompt_log/" + system_prompt_filename
-        user_prompt_filename = "./prompt_log/" + user_prompt_filename
-        print("system prompt for next iteration: " + system_prompt_filename)
-        print("user prompt for next iteration: " + user_prompt_filename)
-        time.sleep(3)
-        if false_clf_df is None or false_clf_df.empty:
-            print("No false classifications to process. Ending iterations.")
+    current_prompts = prompt_paths
+
+    for iteration in range(1, max_iterations + 1):
+        print(f"\n=== Iteration {iteration} ===")
+        # Train batch
+        train_preds = run_screening_batch(
+            client=client,
+            model=main_model,
+            data=X_train.head(train_limit),
+            prompt_paths=current_prompts,
+            limit=calls_per_iter,
+        )
+        train_metrics, false_clf = evaluate_predictions(train_preds, y_train, show_plot=False)
+        print(f"Train metrics: {train_metrics}")
+
+        if false_clf.empty:
+            print("No false classifications; stopping early.")
             break
 
+        # Use the first false classification to revise prompts.
+        row = false_clf.iloc[0]
+        critic_feedback = critic_agent(client, row, current_prompts, model=critic_model)
+        revised_prompts_text = revision_agent(client, row, feedback=critic_feedback, prompt_paths=current_prompts, model=revision_model)
 
-main()
+        system_text, user_text = parse_revised_prompts(revised_prompts_text, current_prompts)
+        current_prompts = current_prompts.next_version(system_text, user_text)
+        print(f"Saved revised prompts: {current_prompts.system_path}, {current_prompts.user_path}")
 
-# problem: in the followinf iterations the abtracts arent correctly passed to the formatted prompt
-# refer to the chatgpt history for more details
+        # Evaluate on validation to check for improvement (optional thresholding could be added).
+        val_preds = run_screening_batch(
+            client=client,
+            model=main_model,
+            data=X_val,
+            prompt_paths=current_prompts,
+            limit=calls_per_iter,
+        )
+        val_metrics, _ = evaluate_predictions(val_preds, y_val, show_plot=False)
+        print(f"Validation metrics: {val_metrics}")
+
+    # Final test evaluation with the latest prompts.
+    test_preds = run_screening_batch(
+        client=client,
+        model=main_model,
+        data=X_test,
+        prompt_paths=current_prompts,
+        limit=calls_per_iter,
+    )
+    test_metrics, _ = evaluate_predictions(test_preds, y_test, show_plot=False)
+    print(f"\nFinal test metrics (latest prompts): {test_metrics}")
+
+
+if __name__ == "__main__":
+    iterative_prompt_optimization()
